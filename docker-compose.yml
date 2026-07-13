@@ -7,7 +7,7 @@ services:
       - .env
     # Headless Chromium typically needs ~500-600MB RAM under normal use.
     # Give the container some headroom; see README.md "Deployment sizing".
-    mem_limit: 1g
+    mem_limit: 2g
     shm_size: "1gb"
     # Default: local json-file logs, capped so months of uptime can't fill the
     # host disk (an INFO line every poll cycle adds up over weeks). Swap this
