@@ -251,15 +251,76 @@ was told not to do. It's implemented defensively:
   (matching the pattern every other `Slot` GET endpoint uses).
 - The full raw response is logged at INFO level the first time it's
   called for real, so you can see the exact shape it returns.
-- `build_filled_properties()` in `bot.py` tries several common field-name
+- `build_filled_properties()` in `formfill.py` tries several common field-name
   keys (`name`, `label`, `propertyName`, `displayName`) and several
   common value keys (`value`, `propertyValue`, `fieldValue`) defensively,
   and logs every fuzzy match it makes.
 
 If the real shape turns out to be different, the fix is localized to
-`get_properties_for_slot()` and `build_filled_properties()` in `bot.py` -
-watch the logs the first time a slot actually gets blocked in
-`block_and_fill` mode and adjust based on what's logged.
+`get_properties_for_slot()` (`client.py`) and `build_filled_properties()`
+(`formfill.py`) - watch the logs the first time a slot actually gets blocked
+in `block_and_fill` mode and adjust based on what's logged.
+
+## Observability
+
+**What you already get, with zero setup:** every log line goes to stdout
+(`docker compose logs -f`), and — more importantly for actually knowing the
+bot is alive — the watchdog built into `Watcher` (see `watcher.py`) already
+pushes the reliability signals that matter straight to Telegram: a startup
+message, a stale-check alert if `STALE_ALERT_MINUTES` passes with no
+successful check (so a captcha/site outage doesn't silently look like "no
+slots today"), an optional periodic heartbeat (`HEARTBEAT_HOURS`), and
+`/status` on demand. For a single-purpose bot like this, that's the signal
+that actually matters, and it already exists.
+
+What that setup *doesn't* give you: log history/search beyond `docker logs`,
+error aggregation (the same captcha-400 gets logged fresh every retry, with
+no dedup/trend view), and — the one real blind spot — if the whole
+container/process dies outright (crash loop, OOM, host reboot), nothing
+inside the process is left to send that "I'm down" Telegram message.
+`docker-compose.yml`'s `restart: unless-stopped` handles the container-level
+crash-and-restart case; it doesn't tell *you* it happened.
+
+Given this is one sequential polling loop in one process (not a
+multi-service system), here's what's worth adding and what isn't:
+
+- **Skip distributed tracing.** Traces exist to show request flow *across*
+  services/spans; there's no such flow here to visualize, so instrumenting
+  one would be pure overhead for no signal.
+- **Sentry (implemented, opt-in): highest value for the effort.** Set
+  `SENTRY_DSN` in `.env` (from a Sentry project, or a Grafana Cloud stack's
+  Sentry-compatible endpoint) and every existing `logger.error(...)` call
+  automatically becomes a Sentry event — no other code changes — with the
+  preceding INFO-level log lines attached as breadcrumbs for context. This
+  gives you aggregation/trends/dedup across captcha failures, block/fill/
+  confirm failures, etc. that Telegram alone doesn't. Deliberately configured
+  with `traces_sample_rate=0` (error tracking only, see above) and
+  `include_local_variables=False` (so a traceback frame can never leak
+  `applicant.env`'s real PII — PESEL, document numbers — to Sentry's
+  servers). Leave `SENTRY_DSN` empty (default) to disable entirely; the
+  `sentry_sdk` package is never even imported in that case. Set
+  `SENTRY_ENVIRONMENT` (default `production`) so a local test run doesn't get
+  mixed into the same alert stream as the real deployment.
+- **Loki (scaffolded, opt-in): fixes the one real blind spot.** Shipping logs
+  to Grafana Cloud Loki doesn't just give you search/history — it lets you
+  set up ONE alert Sentry/Telegram can't: "no log line from this container in
+  N minutes," which fires even if the *entire process* is dead (unlike the
+  in-process stale-check watchdog, which needs the process itself alive to
+  warn you). One-time host setup:
+
+  ```bash
+  docker plugin install grafana/loki-docker-driver:latest --alias loki --grant-all-permissions
+  ```
+
+  Then get your Loki push URL from your Grafana Cloud stack's "Sending logs"
+  page (it embeds credentials as `https://<user-id>:<api-key>@host/loki/api/v1/push`),
+  set `LOKI_URL` in `.env`, and swap the commented `logging:` block in
+  `docker-compose.yml` for the active one (see the comments there — only one
+  logging driver can be active at a time).
+- **Log rotation (implemented, no setup needed):** `docker-compose.yml` now
+  caps local json-file logs at 10MB × 5 files, so months of continuous
+  polling can't quietly fill up the host disk. This applies regardless of
+  whether you also enable Loki.
 
 ## Safety notes
 

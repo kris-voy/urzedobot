@@ -49,6 +49,35 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 
 
+def _init_sentry(config: Config) -> None:
+    """Opt-in error tracking. No-op (no import, no network) unless SENTRY_DSN
+    is set — see README "Observability" for why this is error-tracking only,
+    no performance tracing, and why local variables are excluded."""
+    if not config.sentry_dsn:
+        return
+    import sentry_sdk
+    from sentry_sdk.integrations.logging import LoggingIntegration
+
+    sentry_sdk.init(
+        dsn=config.sentry_dsn,
+        environment=config.sentry_environment,
+        # Error tracking only: this bot is a single sequential polling loop,
+        # not a multi-service request flow, so performance tracing has
+        # nothing useful to show and would just burn quota.
+        traces_sample_rate=0.0,
+        send_default_pii=False,
+        # applicant.env carries one person's real PII (PESEL, passport/doc
+        # numbers) which can end up as a local variable (e.g. self.config.form_data)
+        # in a traceback frame — never let that leave the machine via Sentry.
+        include_local_variables=False,
+        # Every existing logger.error(...) call becomes a Sentry event
+        # (with the preceding INFO+ log lines attached as breadcrumbs for
+        # context) with no other code changes needed.
+        integrations=[LoggingIntegration(level=logging.INFO, event_level=logging.ERROR)],
+    )
+    logger.info("Sentry error tracking enabled (environment=%s).", config.sentry_environment)
+
+
 # =============================================================================
 # Entry point
 # =============================================================================
@@ -155,6 +184,7 @@ def main():
     args = parser.parse_args()
 
     config = Config()
+    _init_sentry(config)
 
     if args.test_telegram:
         asyncio.run(test_telegram(config))

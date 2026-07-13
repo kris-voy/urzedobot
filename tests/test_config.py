@@ -92,3 +92,15 @@ def test_config_invalid_mode_raises():
 def test_config_invalid_captcha_provider_raises():
     with pytest.raises(ValueError, match="Invalid CAPTCHA_PROVIDER"):
         make_config(captcha_provider="magic")
+
+
+def test_sentry_disabled_by_default():
+    cfg = make_config()
+    assert cfg.sentry_dsn == ""
+    assert cfg.sentry_environment == "production"
+
+
+def test_sentry_dsn_and_environment_are_configurable():
+    cfg = make_config(sentry_dsn="https://example@o0.ingest.sentry.io/1", sentry_environment="proxmox")
+    assert cfg.sentry_dsn == "https://example@o0.ingest.sentry.io/1"
+    assert cfg.sentry_environment == "proxmox"

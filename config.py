@@ -85,6 +85,10 @@ class Config:
     proxy_server: str = field(default_factory=lambda: _env("PROXY_SERVER", "").strip())
     proxy_username: str = field(default_factory=lambda: _env("PROXY_USERNAME", "").strip())
     proxy_password: str = field(default_factory=lambda: _env("PROXY_PASSWORD", "").strip())
+    # Optional Sentry error tracking. Empty (default) = disabled entirely, no
+    # sentry_sdk import/init cost paid. See README "Observability".
+    sentry_dsn: str = field(default_factory=lambda: _env("SENTRY_DSN", "").strip())
+    sentry_environment: str = field(default_factory=lambda: _env("SENTRY_ENVIRONMENT", "production").strip())
 
     def __post_init__(self):
         if not self.form_data:
