@@ -50,6 +50,15 @@ python3.14 -m pip install -r requirements.txt
 python3.14 -m playwright install chromium
 ```
 
+For running the test suite (`config`, `dedupe`, `formfill`, `captcha`,
+`notifier` — pure logic only, no browser/Telegram/network involved), install
+the dev extras instead and run pytest:
+
+```powershell
+python3.14 -m pip install -r requirements-dev.txt
+python3.14 -m pytest -q
+```
+
 ## Setting up the Telegram bot
 
 1. **Create the bot.** In Telegram, message **@BotFather**, send `/newbot`,

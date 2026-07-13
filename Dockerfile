@@ -15,7 +15,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
     && python -m playwright install --with-deps chromium
 
-COPY bot.py .
+COPY *.py .
 
 # .env is supplied at runtime via docker-compose env_file (not baked into image)
 
