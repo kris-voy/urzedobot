@@ -1,0 +1,7 @@
+# Secrets / PII — never commit
+.env
+applicant.env
+
+# Python
+__pycache__/
+*.pyc

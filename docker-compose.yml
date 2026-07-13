@@ -1,0 +1,11 @@
+services:
+  bezkolejki-bot:
+    build: .
+    container_name: bezkolejki-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    # Headless Chromium typically needs ~500-600MB RAM under normal use.
+    # Give the container some headroom; see README.md "Deployment sizing".
+    mem_limit: 1g
+    shm_size: "1gb"
