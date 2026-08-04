@@ -1,36 +1,30 @@
 services:
-  bezkolejki-bot:
-    build: .
-    container_name: bezkolejki-bot
+  watcher:
+    build:
+      context: .
+      args:
+        PLAYWRIGHT_VERSION: "1.61.0"
+    image: sv-watcher:1.61.0
+    container_name: sv-watcher
     restart: unless-stopped
+    init: true
     env_file:
       - .env
-    # Headless Chromium typically needs ~500-600MB RAM under normal use.
-    # Give the container some headroom; see README.md "Deployment sizing".
+    environment:
+      MODE: notify_only
+      AUTO_CONFIRM: "false"
+      DATABASE_PATH: /app/data/sv.db
+      DISPLAY: ":99"
+    volumes:
+      - sv-data:/app/data
+    shm_size: "2gb"
     mem_limit: 2g
-    shm_size: "1gb"
-    # Default: local json-file logs, capped so months of uptime can't fill the
-    # host disk (an INFO line every poll cycle adds up over weeks). Swap this
-    # block for the Loki one below to ship logs to Grafana Cloud instead --
-    # see README "Observability". Only one `logging:` driver can be active at
-    # a time, so uncomment Loki AND remove/comment this json-file block.
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "5"
-    # --- Alternative: ship logs to Grafana Cloud Loki instead of local files.
-    # Requires a one-time host setup (see README "Observability" for the full
-    # steps): install the driver with
-    #   docker plugin install grafana/loki-docker-driver:latest --alias loki --grant-all-permissions
-    # then set LOKI_URL in .env to the FULL push URL with credentials embedded
-    # as userinfo, e.g. https://<user-id>:<api-key>@logs-prod-xxx.grafana.net/loki/api/v1/push
-    # (get the exact host/user-id/api-key from your Grafana Cloud stack's Loki
-    # "Sending logs" page). docker compose reads .env for ${...} substitution
-    # in this file, separately from the env_file: above. Then swap the block in:
-    #
-    # logging:
-    #   driver: loki
-    #   options:
-    #     loki-url: "${LOKI_URL}"
-    #     loki-external-labels: "job=bezkolejki-bot"
+    entrypoint: ["/bin/sh", "-c", "Xvfb :99 -screen 0 1280x800x24 -nolisten tcp &\n sleep 1\n exec python bot.py\n"]
+
+volumes:
+  sv-data:

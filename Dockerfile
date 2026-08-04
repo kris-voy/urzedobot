@@ -1,22 +1,22 @@
-# Base image pinned to match the installed Playwright Python package version
-# (checked locally with `python3.14 -m playwright --version` -> 1.61.0).
-#
-# IMPORTANT: Microsoft only publishes playwright/python images for a subset
-# of versions/tags. Before deploying, verify this tag actually exists, e.g.:
-#   docker manifest inspect mcr.microsoft.com/playwright/python:v1.61.0-jammy
-# If it 404s, use the closest published tag <= your local playwright version
-# (see https://mcr.microsoft.com/en-us/product/playwright/python/tags) and
-# pin the same version in requirements.txt so pip and the base image agree.
-FROM mcr.microsoft.com/playwright/python:v1.61.0-jammy
+FROM mcr.microsoft.com/playwright/python:v1.61.0-noble
+
+ARG PLAYWRIGHT_VERSION=1.61.0
+ENV PLAYWRIGHT_VERSION=${PLAYWRIGHT_VERSION} \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    DATABASE_PATH=/app/data/sv.db
 
 WORKDIR /app
-
+RUN apt-get update && apt-get install -y --no-install-recommends xvfb && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
-    && python -m playwright install --with-deps chromium
+    && python -c "import importlib.metadata as m; assert m.version('playwright') == '${PLAYWRIGHT_VERSION}'" \
+    && mkdir -p /app/data \
+    && chown -R pwuser:pwuser /app
 
-COPY *.py .
+COPY --chown=pwuser:pwuser *.py ./
+USER pwuser
 
-# .env is supplied at runtime via docker-compose env_file (not baked into image)
-
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD ["python", "healthcheck.py"]
 CMD ["python", "bot.py"]

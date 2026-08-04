@@ -1,389 +1,533 @@
-"""BezkolejkiClient - browser management + API calls (all via page.evaluate)."""
+"""Read-only Playwright client for the verified bezkolejki availability APIs."""
 from __future__ import annotations
 
 import asyncio
-import logging
 import os
-from typing import Any, Optional
+import re
+import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from typing import Any
 
-from playwright.async_api import async_playwright, Browser, BrowserContext, Page, Playwright
+from playwright.async_api import (
+    Browser,
+    BrowserContext,
+    Error as PlaywrightError,
+    Page,
+    Playwright,
+    TimeoutError as PlaywrightTimeoutError,
+    async_playwright,
+)
 
-from captcha import resolve_captcha_provider
 from config import Config
 from constants import (
+    API_TIMEOUT_MS,
     BASE_URL,
-    CAPTCHA_MAX_RETRIES,
-    CAPTCHA_RETRY_DELAY_SECONDS,
+    CAPTCHA_MINT_SPACING_SECONDS,
+    CAPTCHA_TOKEN_PARAM,
     COMPANY_NAME,
-    RECAPTCHA_SITE_KEY,
+    HCAPTCHA_CHALLENGE_MARKERS,
+    HCAPTCHA_EXECUTE_TIMEOUT_MS,
+    HCAPTCHA_READY_TIMEOUT_MS,
+    HCAPTCHA_SITE_KEY,
     RESERVATION_PAGE_URL,
-    USER_AGENT,
+    SAFE_GET_RETRIES,
+    SERVICE_NAME_TEMPLATE,
+    SITE_CONFIG_URL,
+    UUID_PATTERN,
 )
-from errors import GrabPipelineError, RateLimitedError
+from captcha_solver import CaptchaSolver
+from errors import (
+    ApiError,
+    CaptchaChallengeError,
+    CaptchaContractError,
+    CaptchaError,
+    CaptchaSolverError,
+    RateLimitedError,
+    SchemaError,
+)
 
-logger = logging.getLogger("bezkolejki_bot")
+
+def is_challenge_failure(message: str) -> bool:
+    """True when hCaptcha refused a passive token and demanded interaction."""
+    lowered = (message or "").lower()
+    return any(marker in lowered for marker in HCAPTCHA_CHALLENGE_MARKERS)
+
+
+
+def parse_retry_after(value: str | None) -> float:
+    if not value:
+        return 5.0
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        try:
+            parsed = parsedate_to_datetime(value)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return max(0.0, (parsed - datetime.now(timezone.utc)).total_seconds())
+        except (TypeError, ValueError):
+            return 5.0
+
+
+def parse_catalog(payload: Any, prefixes: list[str]) -> dict[str, dict]:
+    if isinstance(payload, dict):
+        locations = [payload]
+    elif isinstance(payload, list) and payload:
+        locations = payload
+    else:
+        raise SchemaError("catalog must contain at least one localization")
+    matches: dict[str, dict] = {}
+    for location in locations:
+        if not isinstance(location, dict) or not isinstance(location.get("queues"), list):
+            raise SchemaError("catalog localization must contain a queues array")
+        for queue in location["queues"]:
+            if not isinstance(queue, dict) or not isinstance(queue.get("operations"), list):
+                raise SchemaError("catalog queue must contain an operations array")
+            for operation in queue["operations"]:
+                if not isinstance(operation, dict):
+                    raise SchemaError("catalog operation must be an object")
+                prefix = operation.get("prefix")
+                if prefix not in prefixes:
+                    continue
+                expected_name = SERVICE_NAME_TEMPLATE.format(prefix=prefix)
+                if operation.get("name") != expected_name:
+                    raise SchemaError(f"catalog service name mismatch for {prefix}")
+                if operation.get("isReservationActive") is not True:
+                    raise SchemaError(f"catalog reservation is inactive for {prefix}")
+                if not isinstance(operation.get("id"), int):
+                    raise SchemaError(f"catalog operation id is invalid for {prefix}")
+                if prefix in matches:
+                    raise SchemaError(f"catalog contains duplicate operation for {prefix}")
+                matches[prefix] = {
+                    "id": operation["id"],
+                    "prefix": prefix,
+                    "name": operation["name"],
+                    "isReservationActive": True,
+                }
+    missing = [prefix for prefix in prefixes if prefix not in matches]
+    if missing:
+        raise SchemaError(f"catalog is missing validated operations: {', '.join(missing)}")
+    return matches
+
+
+def parse_availability(payload: Any, expected_operation_id: int) -> list[str]:
+    required = {"operationId", "availableDays", "disabledDays", "minDate", "maxDate"}
+    if not isinstance(payload, dict) or not required.issubset(payload):
+        raise SchemaError("availability response does not match the captured schema")
+    if payload["operationId"] != expected_operation_id:
+        raise SchemaError("availability operationId does not match the requested operation")
+    if not isinstance(payload["availableDays"], list) or not all(
+        isinstance(day, str) and day for day in payload["availableDays"]
+    ):
+        raise SchemaError("availableDays must be an array of non-empty strings")
+    if not isinstance(payload["disabledDays"], list):
+        raise SchemaError("disabledDays must be an array")
+    if payload["minDate"] is not None and not isinstance(payload["minDate"], str):
+        raise SchemaError("minDate must be a string or null")
+    if payload["maxDate"] is not None and not isinstance(payload["maxDate"], str):
+        raise SchemaError("maxDate must be a string or null")
+    return payload["availableDays"]
+
+
+def parse_slots(payload: Any) -> list[dict]:
+    if isinstance(payload, list):
+        slots = payload
+    elif isinstance(payload, dict):
+        keys = [key for key in ("availableSlots", "slots", "times") if key in payload]
+        if len(keys) != 1:
+            raise SchemaError("slot response must contain exactly one supported envelope")
+        slots = payload[keys[0]]
+    else:
+        raise SchemaError("slot response must be an array or supported envelope")
+    if not isinstance(slots, list):
+        raise SchemaError("slot envelope must contain an array")
+    result = []
+    for slot in slots:
+        if (
+            not isinstance(slot, dict)
+            or slot.get("id") in (None, "")
+            or not isinstance(slot.get("dateTime"), str)
+            or not slot["dateTime"]
+        ):
+            raise SchemaError("each slot must contain id and dateTime")
+        result.append({"id": slot["id"], "dateTime": slot["dateTime"]})
+    return result
 
 
 class BezkolejkiClient:
-    def __init__(self, config: Optional[Config] = None):
-        self.config = config or Config()
-        self._playwright: Optional[Playwright] = None
-        self._browser: Optional[Browser] = None
-        self._context: Optional[BrowserContext] = None
-        self._page: Optional[Page] = None
-        # Resolve the effective captcha provider once at construction time:
-        # "auto" becomes "2captcha" if an API key is configured, else "browser".
-        # (This mirrors the "auto" resolution captcha.resolve_captcha_provider
-        # does internally — duplicated here only for the human-readable name
-        # used in logs/status, so callers don't need to reach into the
-        # provider object's internals just to know which one got picked.)
-        if self.config.captcha_provider == "auto":
-            self._captcha_provider = "2captcha" if self.config.twocaptcha_api_key else "browser"
-        else:
-            self._captcha_provider = self.config.captcha_provider
-        self._captcha = resolve_captcha_provider(self.config)
-
-    async def start(self):
-        logger.info(
-            "Starting Playwright browser... (captcha provider: %s | headless: %s)",
-            self._captcha_provider, self.config.headless,
+    def __init__(self, config: Config, solver: CaptchaSolver | None = None):
+        self.config = config
+        self._playwright: Playwright | None = None
+        self._browser: Browser | None = None
+        self._context: BrowserContext | None = None
+        self._page: Page | None = None
+        self._auth_token: str | None = None
+        self._last_captcha_mint = 0.0
+        self._sitekey: str | None = None
+        self._widget_id: str | None = None
+        self.solver = solver or CaptchaSolver(
+            config.captcha_solver_provider,
+            config.captcha_solver_api_key,
+            timeout_seconds=config.captcha_solver_timeout_seconds,
+            max_per_hour=config.captcha_solver_max_per_hour,
         )
+        self.solver_engaged = False
+        self.last_challenge_reason: str | None = None
+
+    async def start(self) -> None:
         self._playwright = await async_playwright().start()
-        launch_args = ["--disable-blink-features=AutomationControlled"]
-        if os.name != "nt":
-            launch_args.insert(0, "--no-sandbox")
-        proxy = None
-        if self.config.proxy_server:
-            proxy = {"server": self.config.proxy_server}
-            if self.config.proxy_username:
-                proxy["username"] = self.config.proxy_username
-                proxy["password"] = self.config.proxy_password
-            logger.info("Using proxy: %s", self.config.proxy_server)
-        self._browser = await self._playwright.chromium.launch(
-            headless=self.config.headless,
-            args=launch_args,
-            proxy=proxy,
-        )
-        await self._open_fresh_page()
-        logger.info("Browser ready, reCAPTCHA injected, page loaded.")
+        launch: dict[str, Any] = {"headless": self.config.headless}
+        # Raspberry Pi / arm64 has no bundled Playwright Chromium, so allow the
+        # distro browser to be used instead.
+        executable = os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH", "").strip()
+        if executable:
+            launch["executable_path"] = executable
+        self._browser = await self._playwright.chromium.launch(**launch)
 
-    async def _open_fresh_page(self):
-        """Create a brand-new browser context + page and load the site. Each
-        fresh context resets the reCAPTCHA v3 session, which is essential:
-        minting many tokens from one long-lived page makes the score decay and
-        the server starts rejecting them (observed: 1st cycle OK, then all fail).
-        Called at start and refreshed before each polling cycle."""
-        # Close the previous context (if any) so we don't leak contexts/pages.
-        try:
-            if self._context is not None:
-                await self._context.close()
-        except Exception:
-            pass
-        self._context = await self._browser.new_context(
-            user_agent=USER_AGENT,
-            locale="pl-PL",
-        )
-        await self._context.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-        )
-        self._page = await self._context.new_page()
-        await self._page.goto(RESERVATION_PAGE_URL, wait_until="networkidle")
-        await self._inject_recaptcha()
-
-    async def refresh_page(self):
-        """Public: start a fresh reCAPTCHA session for the next cycle."""
-        await self._open_fresh_page()
-
-    async def stop(self):
-        logger.info("Stopping browser...")
-        try:
-            if self._context:
-                await self._context.close()
-        except Exception:
-            pass
-        try:
-            if self._browser:
-                await self._browser.close()
-        except Exception:
-            pass
-        try:
-            if self._playwright:
-                await self._playwright.stop()
-        except Exception:
-            pass
-        self._page = None
-        self._context = None
+    async def stop(self) -> None:
+        await self._close_context()
+        if self._browser:
+            await self._browser.close()
+        if self._playwright:
+            await self._playwright.stop()
         self._browser = None
         self._playwright = None
+        self._auth_token = None
 
-    async def restart(self):
-        await self.stop()
-        await self.start()
+    async def begin_cycle(self) -> None:
+        """Open a fresh context for catalog discovery (service-level)."""
+        if not self._browser:
+            raise RuntimeError("browser is not started")
+        await self._close_context()
+        self._context = await self._browser.new_context(locale="pl-PL")
+        await self._open_page()
+        self._auth_token = None
 
-    async def _inject_recaptcha(self):
-        assert self._page is not None
-        await self._page.evaluate(
-            """
-            (key) => new Promise((res, rej) => {
-                if (window.grecaptcha && window.grecaptcha.execute) return res();
-                const s = document.createElement('script');
-                s.src = 'https://www.google.com/recaptcha/api.js?render=' + key;
-                s.onload = res; s.onerror = rej;
-                document.head.appendChild(s);
-            })
-            """,
-            RECAPTCHA_SITE_KEY,
+    async def begin_queue(self) -> None:
+        """Open a brand-new browser context for one queue's availability check.
+
+        Each queue gets its own isolated context so that every CAPTCHA mint
+        is a first-mint in a clean session — the root cause of B and C failing
+        in the old shared-context approach.
+        """
+        if not self._browser:
+            raise RuntimeError("browser is not started")
+        await self._close_context()
+        # Deliberately use Chromium's native identity: no UA override, stealth
+        # script, proxy/profile rotation, or launch-time masking arguments.
+        self._context = await self._browser.new_context(locale="pl-PL")
+        await self._open_page()
+        self._auth_token = None
+        self._last_captcha_mint = 0.0
+
+    async def _close_context(self) -> None:
+        if self._context:
+            try:
+                await self._context.close()
+            except Exception:
+                pass
+            self._context = None
+            self._page = None
+        self._widget_id = None
+
+    async def _open_page(self) -> None:
+        assert self._context
+        if self._page and not self._page.is_closed():
+            await self._page.close()
+        self._page = await self._context.new_page()
+        self._page.set_default_timeout(API_TIMEOUT_MS)
+        await self._page.goto(
+            RESERVATION_PAGE_URL,
+            wait_until="domcontentloaded",
+            timeout=API_TIMEOUT_MS,
         )
-        # wait for grecaptcha.execute to become available
-        await self._page.wait_for_function(
-            "() => window.grecaptcha && window.grecaptcha.execute"
-        )
 
-    async def _mint_captcha_token(self, action: str) -> str:
-        assert self._page is not None
-        return await self._captcha.mint(self._page, action)
+    async def _discover_sitekey(self) -> str:
+        """Resolve the live hCaptcha sitekey, falling back to the pinned constant.
 
-    async def _get_stored_token(self) -> Optional[str]:
-        assert self._page is not None
-        return await self._page.evaluate("() => localStorage.getItem('token')")
+        Reading it at runtime means a sitekey rotation by the site is a non-event
+        instead of a total outage.
+        """
+        if self._sitekey:
+            return self._sitekey
+        assert self._page
+        candidates: list[str] = []
+        try:
+            found = await self._page.evaluate(
+                """
+                () => {
+                    const out = [];
+                    for (const el of document.querySelectorAll('[data-sitekey]')) {
+                        out.push(el.getAttribute('data-sitekey'));
+                    }
+                    for (const script of document.querySelectorAll('script[src]')) {
+                        const match = script.src.match(/[?&](sitekey|render)=([^&]+)/);
+                        if (match) out.push(decodeURIComponent(match[2]));
+                    }
+                    if (window.hcaptchaSiteKey) out.push(window.hcaptchaSiteKey);
+                    return out;
+                }
+                """
+            )
+            candidates.extend(item for item in (found or []) if isinstance(item, str))
+        except Exception:
+            pass
+        if not any(re.fullmatch(UUID_PATTERN, item) for item in candidates):
+            try:
+                config_js = await self._page.evaluate(
+                    """
+                    async url => {
+                        const response = await fetch(url, {cache: 'no-store'});
+                        return response.ok ? await response.text() : '';
+                    }
+                    """,
+                    SITE_CONFIG_URL,
+                )
+                candidates.extend(re.findall(UUID_PATTERN, config_js or ""))
+            except Exception:
+                pass
+        for candidate in candidates:
+            if re.fullmatch(UUID_PATTERN, candidate):
+                self._sitekey = candidate
+                return candidate
+        self._sitekey = HCAPTCHA_SITE_KEY
+        return self._sitekey
 
-    async def _set_stored_token(self, token: str):
-        assert self._page is not None
-        await self._page.evaluate("(t) => localStorage.setItem('token', t)", token)
+    async def _ensure_hcaptcha(self) -> None:
+        """Wait for the page's own hCaptcha API. We never inject our own script."""
+        assert self._page
+        try:
+            await self._page.wait_for_function(
+                "() => window.hcaptcha && window.hcaptcha.render && window.hcaptcha.execute",
+                timeout=HCAPTCHA_READY_TIMEOUT_MS,
+            )
+        except Exception as exc:
+            has_grecaptcha = False
+            try:
+                has_grecaptcha = bool(
+                    await self._page.evaluate("() => !!(window.grecaptcha)")
+                )
+            except Exception:
+                pass
+            detail = (
+                "page exposes grecaptcha but not hcaptcha"
+                if has_grecaptcha
+                else "page exposes no usable hcaptcha API"
+            )
+            raise CaptchaContractError(detail) from exc
 
-    async def ensure_auth_token(self):
-        """Fetch a fresh auth token if none is stored yet."""
-        token = await self._get_stored_token()
-        if token:
-            return token
-        token = await self._fetch_new_token()
-        await self._set_stored_token(token)
+    async def _ensure_widget(self) -> str:
+        """Render one invisible hCaptcha widget per browser context and cache its id."""
+        assert self._page
+        if self._widget_id is not None:
+            return self._widget_id
+        await self._ensure_hcaptcha()
+        sitekey = await self._discover_sitekey()
+        try:
+            widget_id = await self._page.evaluate(
+                """
+                sitekey => {
+                    let host = document.getElementById('sv-hcaptcha-host');
+                    if (!host) {
+                        host = document.createElement('div');
+                        host.id = 'sv-hcaptcha-host';
+                        host.style.display = 'none';
+                        document.body.appendChild(host);
+                    }
+                    return window.hcaptcha.render(host, {
+                        sitekey: sitekey,
+                        size: 'invisible',
+                    });
+                }
+                """,
+                sitekey,
+            )
+        except Exception as exc:
+            raise CaptchaContractError(f"hcaptcha.render failed: {exc}") from exc
+        if widget_id is None:
+            raise CaptchaContractError("hcaptcha.render returned no widget id")
+        self._widget_id = str(widget_id)
+        return self._widget_id
+
+    async def _mint_native(self) -> str:
+        assert self._page
+        widget_id = await self._ensure_widget()
+        try:
+            response = await self._page.evaluate(
+                """
+                async ({widgetId, timeout}) => {
+                    try {
+                        const result = await window.hcaptcha.execute(widgetId, {async: true});
+                        return {ok: true, token: (result && result.response) || result};
+                    } catch (err) {
+                        return {ok: false, error: String((err && err.message) || err)};
+                    }
+                }
+                """,
+                {"widgetId": widget_id, "timeout": HCAPTCHA_EXECUTE_TIMEOUT_MS},
+            )
+        except Exception as exc:
+            message = str(exc)
+            if is_challenge_failure(message):
+                raise CaptchaChallengeError(message) from exc
+            raise CaptchaContractError(f"hcaptcha.execute failed: {message}") from exc
+        if not isinstance(response, dict) or not response.get("ok"):
+            detail = (response or {}).get("error", "unknown hcaptcha error")
+            if is_challenge_failure(detail):
+                raise CaptchaChallengeError(detail)
+            raise CaptchaContractError(f"hcaptcha.execute failed: {detail}")
+        token = response.get("token")
+        if not isinstance(token, str) or not token:
+            raise CaptchaChallengeError("hcaptcha returned an empty token")
+        # Reset the widget so the next execute is a fresh challenge rather than a
+        # replay of a token the server has already consumed.
+        try:
+            await self._page.evaluate(
+                "widgetId => window.hcaptcha.reset(widgetId)", widget_id
+            )
+        except Exception:
+            self._widget_id = None
         return token
 
-    async def _fetch_new_token(self) -> str:
-        assert self._page is not None
-        result = await self._page.evaluate(
-            """
-            async (baseUrl) => {
-                const resp = await fetch(baseUrl + '/Authentication/GetEmptyToken/ouw', {method: 'GET'});
-                const status = resp.status;
-                // Read the body ONCE (a Response stream can't be read twice),
-                // then try to parse it as JSON.
-                const raw = await resp.text();
-                let body = null;
-                try { body = JSON.parse(raw); } catch (e) { body = null; }
-                return {status, body, raw};
-            }
-            """,
-            BASE_URL,
-        )
-        if result["status"] != 200 or not isinstance(result["body"], dict) or "token" not in result["body"]:
-            snippet = (result.get("raw") or "")[:300]
-            raise GrabPipelineError(
-                f"Failed to get auth token (HTTP {result.get('status')}): {snippet!r}"
-            )
-        return result["body"]["token"]
+    async def _captcha(self, action: str) -> str:
+        assert self._page
+        elapsed = time.monotonic() - self._last_captcha_mint
+        if elapsed < CAPTCHA_MINT_SPACING_SECONDS:
+            await asyncio.sleep(CAPTCHA_MINT_SPACING_SECONDS - elapsed)
+        try:
+            token = await self._mint_native()
+        except CaptchaChallengeError as challenge:
+            self.last_challenge_reason = str(challenge)
+            if not self.solver.enabled:
+                raise
+            try:
+                token = await self.solver.solve(
+                    await self._discover_sitekey(), RESERVATION_PAGE_URL
+                )
+            except CaptchaSolverError as exc:
+                raise CaptchaChallengeError(
+                    f"{challenge.detail}; solver fallback failed: {exc.detail}"
+                ) from exc
+            self.solver_engaged = True
+        self._last_captcha_mint = time.monotonic()
+        return token
 
-    async def _api_call(
+
+    async def _request_json(
         self,
-        method: str,
         path: str,
-        action: str,
-        query_params: Optional[dict] = None,
-        json_body: Optional[dict] = None,
-        include_h_captcha: bool = False,
-        captcha_retries_left: int = CAPTCHA_MAX_RETRIES,
-        captcha_body_key: Optional[str] = None,
-    ) -> dict:
-        """
-        Perform an authenticated + recaptcha-protected API call via page.evaluate,
-        using in-page fetch. Handles the one-retry-after-5s-on-400 rule (minting a
-        FRESH captcha token on the retry, never reusing a stale one) and raises
-        RateLimitedError on 429.
-
-        The captcha token is placed as a query param (?recaptchaToken=...) when
-        query_params is not None, OR - if captcha_body_key is given - as a key
-        inside json_body instead (used for endpoints like BlockSlot/
-        ConfirmReservation whose documented body shape embeds "captchaToken").
-        """
-        assert self._page is not None
-        token = await self.ensure_auth_token()
-        captcha_token = await self._mint_captcha_token(action)
-
-        params = None
-        if query_params is not None:
-            params = dict(query_params)
-            params["recaptchaToken"] = captcha_token
-            if include_h_captcha:
-                # Intentional: the site's own SPA passes the literal "fakeToken"
-                # for hCaptchaToken when hCaptcha-before-calendar is disabled
-                # (which it is for these queues). Verified in the site JS bundle.
-                params["hCaptchaToken"] = "fakeToken"
-
-        body = None
-        if json_body is not None:
-            body = dict(json_body)
-            if captcha_body_key:
-                body[captcha_body_key] = captcha_token
-
+        params: dict[str, Any] | None = None,
+        *,
+        authenticated: bool = False,
+        captcha_action: str | None = None,
+    ) -> Any:
+        assert self._page
+        token = await self._ensure_auth_token() if authenticated else None
+        safe_params = dict(params or {})
+        if captcha_action:
+            safe_params[CAPTCHA_TOKEN_PARAM] = await self._captcha(captcha_action)
         result = await self._page.evaluate(
             """
-            async (args) => {
-                const {baseUrl, path, method, token, params, body} = args;
-                let url = baseUrl + path;
-                if (params) {
-                    const qs = new URLSearchParams(params).toString();
-                    url += (url.includes('?') ? '&' : '?') + qs;
+            async args => {
+                const url = new URL(args.baseUrl + args.path);
+                for (const [key, value] of Object.entries(args.params)) {
+                    url.searchParams.set(key, String(value));
                 }
-                const opts = {
-                    method,
-                    headers: {
-                        'Authorization': 'Bearer ' + token,
-                    },
-                };
-                if (body !== null && body !== undefined) {
-                    opts.headers['Content-Type'] = 'application/json';
-                    opts.body = JSON.stringify(body);
+                const controller = new AbortController();
+                const timer = setTimeout(() => controller.abort(), args.timeout);
+                try {
+                    const headers = args.token ? {Authorization: 'Bearer ' + args.token} : {};
+                    const response = await fetch(url, {
+                        method: 'GET', headers, signal: controller.signal,
+                    });
+                    let body = null;
+                    let json = true;
+                    try { body = await response.json(); } catch (_) { json = false; }
+                    return {
+                        status: response.status,
+                        body,
+                        json,
+                        retryAfter: response.headers.get('Retry-After'),
+                    };
+                } finally {
+                    clearTimeout(timer);
                 }
-                const resp = await fetch(url, opts);
-                const status = resp.status;
-                let respBody = null;
-                try { respBody = await resp.json(); } catch (e) {
-                    try { respBody = await resp.text(); } catch (e2) { respBody = null; }
-                }
-                return {status, body: respBody};
             }
             """,
             {
                 "baseUrl": BASE_URL,
                 "path": path,
-                "method": method,
+                "params": safe_params,
                 "token": token,
-                "params": params,
-                "body": body,
+                "timeout": API_TIMEOUT_MS,
             },
         )
-
         status = result["status"]
-        resp_body = result["body"]
-
         if status == 429:
-            raise RateLimitedError(f"429 on {path}: {resp_body}")
+            raise RateLimitedError(path, parse_retry_after(result.get("retryAfter")))
+        if status == 400 and captcha_action:
+            detail = result.get("body")
+            if isinstance(detail, dict):
+                detail = detail.get("message") or detail.get("Message") or detail
+            reason = str(detail).strip() if detail not in (None, "") else "rejected token"
+            raise CaptchaError(f"{path} ({reason[:120]})", status)
+        if status >= 400 or not result.get("json"):
+            raise ApiError(path, status)
+        return result["body"]
 
-        if status == 400 and captcha_retries_left > 0:
-            attempt = CAPTCHA_MAX_RETRIES - captcha_retries_left + 1
-            backoff = CAPTCHA_RETRY_DELAY_SECONDS * attempt  # 5s, then 10s
-            logger.warning(
-                "%s -> HTTP 400 (likely captcha validation), retry %d/%d after %ss: %s",
-                path, attempt, CAPTCHA_MAX_RETRIES, backoff, resp_body,
-            )
-            await asyncio.sleep(backoff)
-            return await self._api_call(
-                method, path, action, query_params, json_body, include_h_captcha,
-                captcha_retries_left=captcha_retries_left - 1,
-                captcha_body_key=captcha_body_key,
-            )
+    async def _safe_get(self, *args: Any, **kwargs: Any) -> Any:
+        for attempt in range(SAFE_GET_RETRIES + 1):
+            try:
+                return await self._request_json(*args, **kwargs)
+            except RateLimitedError as exc:
+                if attempt >= SAFE_GET_RETRIES:
+                    raise
+                await asyncio.sleep(exc.retry_after)
+            except CaptchaError:
+                # Never retry captcha failures: a rejected or challenged token is
+                # not transient, and retrying multiplies the request volume that
+                # damaged our reputation in the first place.
+                raise
+            except (ApiError, TimeoutError, PlaywrightTimeoutError, PlaywrightError):
+                if attempt >= SAFE_GET_RETRIES:
+                    raise
+                await asyncio.sleep(1)
 
-        if status >= 400:
-            raise GrabPipelineError(f"{path} -> HTTP {status}: {resp_body}")
+    async def _ensure_auth_token(self) -> str:
+        if self._auth_token:
+            return self._auth_token
+        body = await self._safe_get(f"/Authentication/GetEmptyToken/{COMPANY_NAME}")
+        if not isinstance(body, dict) or not isinstance(body.get("token"), str) or not body["token"]:
+            raise SchemaError("authentication response does not contain a token")
+        self._auth_token = body["token"]
+        return self._auth_token
 
-        # if the response carries a fresh token, replace the stored one
-        if isinstance(resp_body, dict) and resp_body.get("token"):
-            await self._set_stored_token(resp_body["token"])
+    async def discover_catalog(self, prefixes: list[str]) -> dict[str, dict]:
+        body = await self._safe_get(
+            f"/Operation/GetReservationLocalizations/{COMPANY_NAME}",
+            authenticated=True,
+        )
+        return parse_catalog(body, prefixes)
 
-        return {"status": status, "body": resp_body}
-
-    # -- Public API methods ---------------------------------------------------
-
-    async def get_available_days(self, operation_id: int) -> dict:
-        res = await self._api_call(
-            "GET",
+    async def get_available_days(self, operation_id: int) -> list[str]:
+        body = await self._safe_get(
             "/Slot/GetAvailableDaysForOperation",
-            "GetAvailableDaysForOperation",
-            query_params={"companyName": COMPANY_NAME, "lastStepId": operation_id},
+            {"companyName": COMPANY_NAME, "lastStepId": operation_id},
+            authenticated=True,
+            captcha_action="GetAvailableDaysForOperation",
         )
-        return res["body"]
+        return parse_availability(body, operation_id)
 
-    async def get_available_slots(self, operation_id: int, day: str) -> list:
-        res = await self._api_call(
-            "GET",
+    async def get_available_slots(self, operation_id: int, day: str) -> list[dict]:
+        body = await self._safe_get(
             "/Slot/GetAvailableSlotsForOperationAndDay",
-            "GetAvailableSlotsForOperationAndDay",
-            query_params={"companyName": COMPANY_NAME, "lastStepId": operation_id, "day": day},
-            include_h_captcha=True,
-        )
-        body = res["body"]
-        return body if isinstance(body, list) else body.get("slots", []) if isinstance(body, dict) else []
-
-    async def block_slot(self, slot_id) -> dict:
-        res = await self._api_call(
-            "POST",
-            "/Slot/BlockSlot",
-            "BlockSlot",
-            query_params=None,
-            json_body={
-                "slotId": slot_id,
+            {
                 "companyName": COMPANY_NAME,
-                "captchaToken": "",  # placeholder, injected fresh by _api_call
-                "captchaV2Token": "",
-                "blockedBy": 1,
+                "lastStepId": operation_id,
+                "day": day,
             },
-            captcha_body_key="captchaToken",
+            authenticated=True,
+            captcha_action="GetAvailableSlotsForOperationAndDay",
         )
-        return res["body"]
-
-    async def get_properties_for_slot(self, slot_id) -> Any:
-        """
-        NOTE: this endpoint's exact parameter shape was NOT live-verified.
-        We pass companyName + slotId + recaptchaToken (matching the pattern of
-        every other Slot endpoint) and log the full response so the real shape
-        can be confirmed / adjusted on first real use.
-        """
-        try:
-            res = await self._api_call(
-                "GET",
-                "/Slot/GetPropertiesForSlot",
-                "GetPropertiesForSlot",
-                query_params={"companyName": COMPANY_NAME, "slotId": slot_id},
-            )
-            logger.info("GetPropertiesForSlot response: %s", res["body"])
-            return res["body"]
-        except GrabPipelineError as e:
-            logger.error("GetPropertiesForSlot failed (unverified endpoint, see spec notes): %s", e)
-            raise
-
-    async def update_slot_properties(self, properties: list) -> dict:
-        res = await self._api_call(
-            "POST",
-            "/Slot/UpdateSlotProperties",
-            "UpdateSlotProperties",
-            query_params={},  # recaptchaToken appended by _api_call via query_params
-            json_body={"isAnonymous": False, "properties": properties},
-        )
-        return res["body"]
-
-    async def confirm_reservation(self) -> dict:
-        res = await self._api_call(
-            "POST",
-            "/Slot/ConfirmReservation",
-            "ConfirmReservation",
-            query_params=None,
-            json_body={
-                "captchaToken": "",  # placeholder, injected fresh by _api_call
-                "isAnonymous": False,
-                "smsCode": None,
-                "allowSendDocument": True,
-            },
-            captcha_body_key="captchaToken",
-        )
-        return res["body"]
-
-    @property
-    def is_alive(self) -> bool:
-        # Check the browser connection too, not just the Page flag: a crashed
-        # Chromium / dropped CDP connection leaves the Page object "open" but
-        # every evaluate() fails — detecting it here triggers a proactive
-        # restart instead of burning 3 failed cycles first.
-        if self._browser is not None and not self._browser.is_connected():
-            return False
-        return self._page is not None and not self._page.is_closed()
+        return parse_slots(body)

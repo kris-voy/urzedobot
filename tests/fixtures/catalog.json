@@ -1,0 +1,32 @@
+[
+{
+  "id": 31,
+  "name": "Opolski Urząd Wojewódzki",
+  "queues": [
+    {
+      "id": 5722,
+      "name": "Centrum Obsługi Cudzoziemców",
+      "operations": [
+        {
+          "id": 3213864,
+          "prefix": "A",
+          "name": "Wydawanie dokumentów (karty pobytu, zaproszenia) A",
+          "isReservationActive": true
+        },
+        {
+          "id": 3219596,
+          "prefix": "B",
+          "name": "Wydawanie dokumentów (karty pobytu, zaproszenia) B",
+          "isReservationActive": true
+        },
+        {
+          "id": 3219597,
+          "prefix": "C",
+          "name": "Wydawanie dokumentów (karty pobytu, zaproszenia) C",
+          "isReservationActive": true
+        }
+      ]
+    }
+  ]
+}
+]

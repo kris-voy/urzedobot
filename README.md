@@ -1,334 +1,247 @@
-# bezkolejki.eu appointment slot watcher + Telegram bot
+# SV notify-only appointment watcher
 
-Watches the Polish government reservation site
-[uw.bezkolejki.eu/ouw/Reservation](https://uw.bezkolejki.eu/ouw/Reservation)
-for free slots in three queues, and when one appears can automatically block
-it, fill the reservation form, and (on your confirmation via a Telegram
-button) submit it. Built for a single personal appointment - it polls
-politely and only talks to one Telegram chat id.
+This service discovers the current A/B/C reservation operations from the
+official uw.bezkolejki.eu catalog, checks availability for all three queues
+every cycle (each queue gets its own fresh browser context so reCAPTCHA tokens
+never bleed between them), sends urgent outbound Telegram alerts, and accepts
+Telegram chat commands from the configured admin chat.
+It cannot block, fill, or confirm an appointment.
 
-## What it does
+The only supported mode is MODE=notify_only. Startup rejects block,
+block_and_fill, and AUTO_CONFIRM=true.
 
-1. Runs a headless Chromium browser (via Playwright) that loads the
-   reservation page once and keeps it open, so it has a valid session/token
-   and can mint real Google reCAPTCHA v3 tokens (required by every API call
-   on this site).
-2. On a schedule (fast polling during a configurable morning window, slow
-   polling otherwise), checks each configured queue (A/B/C) for available
-   days.
-3. When a queue has an available day, depending on `MODE`:
-   - `notify_only` - sends a Telegram message with the details and a link.
-   - `block` - calls the site's `BlockSlot` API to hold the slot, then
-     notifies you to finish manually within the hold window.
-   - `block_and_fill` (default) - blocks the slot, fetches the dynamic
-     reservation form fields, fills them from your configured personal data,
-     and either submits immediately (`AUTO_CONFIRM=true`) or sends a
-     Telegram message with **Confirm** / **Release** buttons and waits up to
-     4 minutes for your decision.
-4. After a successful confirmation it tells you to check your email (the
-   site requires clicking a confirmation link - "two-step email
-   confirmation") and stops polling.
-5. If anything in the block/fill/confirm pipeline fails partway, it still
-   sends you the availability info and the reservation link so you can
-   finish manually - it never just silently gives up.
-6. Never crashes on transient errors: captcha hiccups are retried once,
-   rate limiting (`429`) triggers a 5-minute backoff, and if the browser
-   session dies or too many check cycles fail in a row, it restarts the
-   browser and keeps going.
+## Deploy — option A: LXC / VM with real desktop browser (recommended)
 
-## Requirements
+Running a real visible Chromium scores highest on reCAPTCHA v3. Use this on
+any Proxmox LXC or VM that has a desktop session (Xorg + openbox or xfce4).
 
-- Python 3.14 (this machine's interpreter is `python3.14`)
-- Playwright with the Chromium browser installed
-- python-telegram-bot v22+
-- python-dotenv
+1. Install system deps and Playwright:
 
-Install (Windows, from this directory):
+       apt-get install -y python3 python3-pip xorg openbox
+       pip3 install -r requirements.txt
+       playwright install chromium
+       playwright install-deps chromium
 
-```powershell
-python3.14 -m pip install -r requirements.txt
-python3.14 -m playwright install chromium
-```
+2. Copy config.example.env to .env and fill in TELEGRAM_BOT_TOKEN and
+   TELEGRAM_CHAT_ID. Set:
 
-For running the test suite (`config`, `dedupe`, `formfill`, `captcha`,
-`notifier` — pure logic only, no browser/Telegram/network involved), install
-the dev extras instead and run pytest:
+       HEADLESS=false
 
-```powershell
-python3.14 -m pip install -r requirements-dev.txt
-python3.14 -m pytest -q
-```
+3. Create a systemd user service (e.g. `~/.config/systemd/user/sv.service`):
 
-## Setting up the Telegram bot
+       [Unit]
+       Description=SV slot watcher
+       After=graphical-session.target
 
-1. **Create the bot.** In Telegram, message **@BotFather**, send `/newbot`,
-   and follow the prompts (pick a display name and a unique username ending
-   in `bot`). BotFather replies with a token that looks like
-   `123456789:AAExampleTokenHere` - this is your `TELEGRAM_BOT_TOKEN`.
+       [Service]
+       Environment=DISPLAY=:0
+       WorkingDirectory=/opt/sv
+       ExecStart=/usr/bin/python3 bot.py
+       Restart=always
+       RestartSec=10
 
-2. **Get your chat id.** Open a chat with your new bot in Telegram and send
-   it any message (e.g. `/start`). Then, in a browser or with `curl`, visit:
+       [Install]
+       WantedBy=default.target
 
-   ```
-   https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates
-   ```
+4. Enable and start:
 
-   Look for `"chat":{"id":123456789, ...}` in the JSON response - that
-   number is your `TELEGRAM_CHAT_ID`. (If you see an empty `"result":[]`,
-   make sure you actually sent the bot a message first, then reload.)
+       systemctl --user enable sv
+       systemctl --user start sv
 
-   Alternatively, once the bot is running with a placeholder chat id, run it
-   and use `/status` from any chat - unauthorized senders are simply
-   ignored, so this only really works once you already have the right id
-   from `getUpdates`.
+State lives at DATABASE_PATH (default `/app/data/sv.db`; override in .env for
+a non-container path, e.g. `/home/user/sv.db`).
 
-3. Put both values into your `.env` file (see below).
+## Deploy — option B: Docker with headless Xvfb (no local desktop needed)
 
-## Configuration
+The docker-compose.yml starts an Xvfb virtual display inside the container
+before launching the watcher, giving Chromium a real DISPLAY without requiring
+a host desktop. This is more reliable than fully headless mode.
 
-Copy the example env file and edit it:
+1. Copy config.example.env to .env.
+2. Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID. Keep `HEADLESS=false` (the
+   compose file already sets `DISPLAY=:99` for Xvfb).
+3. Revoke any previously configured 2Captcha API key in the 2Captcha account;
+   this project no longer reads or supports it.
+4. Start the watcher:
 
-```powershell
-Copy-Item config.example.env .env
-notepad .env
-```
+       docker compose up -d --build
 
-Key settings (see `config.example.env` for full documentation of every
-key):
+State is stored in SQLite at /app/data/sv.db on the named sv-data volume.
+SQLite uses WAL mode and a five-second busy timeout. The container runs as the
+image's unprivileged pwuser.
 
-| Key | Meaning |
-|---|---|
-| `TELEGRAM_BOT_TOKEN` | Token from BotFather |
-| `TELEGRAM_CHAT_ID` | Your numeric chat id (only this id is obeyed) |
-| `QUEUES` | Which of `A,B,C` to watch |
-| `MODE` | `notify_only`, `block`, or `block_and_fill` |
-| `AUTO_CONFIRM` | `true` to submit immediately after filling; `false` to wait for a Telegram button |
-| `FAST_WINDOW` | Local (Europe/Warsaw) time range for fast polling, e.g. `05:45-08:45` |
-| `FAST_INTERVAL_SECONDS` / `SLOW_INTERVAL_SECONDS` | Poll intervals (±20% jitter applied) |
-| `FORM_*` | Applicant data for auto-fill. Kept in a **separate `applicant.env`** file, not `.env` — see "Applicant data" below. Any `FORM_XXX_YYY` key becomes a fuzzy-matched candidate value for a reservation form field labeled roughly "xxx yyy" |
-| `CAPTCHA_PROVIDER` | `auto` (default), `browser`, or `2captcha` -- see "Captcha reliability" below |
-| `TWOCAPTCHA_API_KEY` | Your 2captcha.com API key (optional; enables the `2captcha` provider) |
-| `CAPTCHA_MIN_SCORE` | Minimum reCAPTCHA v3 score requested from 2captcha, default `0.3` |
-| `HEADLESS` | Whether Chromium launches headless, default `true` |
+Playwright is pinned to 1.61.0 in both requirements.txt and the
+v1.61.0-noble image. Keep those versions identical when upgrading.
 
-## Applicant data (auto-fill)
+## Administration over SSH
 
-Only needed for `MODE=block_and_fill`. The applicant's personal details live in
-a **separate file, `applicant.env`**, kept apart from `.env` so operational
-settings and private data don't mix. Two ways to create it:
+Run all administration through the existing watcher container:
 
-- **Guided wizard (recommended):** `python3.14 setup_applicant.py` — asks for
-  each field (name, surname, DOB, email, phone, case number, PESEL, document
-  numbers), shows current values as defaults on re-run, and writes the file for
-  you. Runs anywhere, no server needed.
-- **By hand:** copy `applicant.example.env` to `applicant.env` and edit.
+    docker compose exec watcher python svctl.py status
+    docker compose exec watcher python svctl.py status --json
+    docker compose exec watcher python svctl.py events --level ERROR
+    docker compose exec watcher python svctl.py events --follow
+    docker compose exec watcher python svctl.py doctor
+    docker compose exec watcher python svctl.py check --wait 120
+    docker compose exec watcher python svctl.py pause
+    docker compose exec watcher python svctl.py resume
 
-The bot loads `applicant.env` automatically on start (its `FORM_*` values
-override any left in `.env`). The file is optional — without it, `notify_only`
-and `block` modes still work fully; only auto-fill needs it.
+check, pause, and resume enqueue commands in SQLite. They never start a second
+browser. Paused state, incidents, availability deduplication, events, commands,
+and pending Telegram delivery all survive a restart.
 
-Note: the site only reveals the exact form fields once a real slot is blocked,
-so fill in everything you can — unmatched values are ignored and unmatched
-fields are left blank for you to finish from the Telegram link. The first real
-grab logs the site's true field names so the list can be tightened.
+### Telegram admin commands
 
-## Captcha reliability
+The watcher polls Telegram `getUpdates` with long-polling and persists the last
+processed update offset in SQLite, so commands are not replayed after restart.
+Only commands from `TELEGRAM_CHAT_ID` are accepted; all other chats are ignored
+and logged.
 
-Every `/Slot/*` API call on this site requires a Google reCAPTCHA v3 token.
-reCAPTCHA v3 doesn't show a challenge -- it silently scores how "human" the
-request looks (0.0-1.0) and the server rejects low-scoring tokens with
-HTTP 400 ("Error while verify captcha"). The bot already retries once or
-twice on a 400 with backoff, but the deeper problem is the score itself:
+Supported commands:
 
-- Tokens minted in-page by an automated headless browser tend to score low,
-  and it's **much worse on a datacenter/VPS IP** than on a home/residential
-  IP, because reCAPTCHA also factors in IP reputation. If you're running
-  this on a VPS (mikr.us, Hetzner, etc.), you should expect the in-page
-  browser method (`CAPTCHA_PROVIDER=browser`) to fail unpredictably.
-- The fix is `CAPTCHA_PROVIDER=2captcha`: this mints the token via the
-  [2captcha.com](https://2captcha.com) solving service instead, which
-  reliably returns high-scoring tokens (it runs the challenge through real
-  browser farms / residential exit nodes on their end). Cost is roughly
-  **$1-3 per 1000 solves** -- sign up, add a few dollars of balance, and set
-  `TWOCAPTCHA_API_KEY` in your `.env`. With `CAPTCHA_PROVIDER=auto` (the
-  default), the bot automatically uses 2captcha once a key is present and
-  falls back to the browser method otherwise, so on a VPS you almost
-  certainly want to set that key.
-- The Playwright browser is **still required** even with `2captcha` set --
-  it holds the Cloudflare clearance and auth token and performs the actual
-  in-page `fetch` for every API call. 2captcha only replaces how the
-  reCAPTCHA token itself is minted.
-- `HEADLESS` (default `true`) controls whether Chromium launches headless.
-  If you're stuck on the browser method (no 2captcha key) on a Linux VPS,
-  running headful (`HEADLESS=false`) under a virtual display can sometimes
-  improve scores -- wrap the process with `xvfb-run` (e.g.
-  `xvfb-run python3.14 bot.py`, or in `docker-compose.yml` wrap the
-  container's entrypoint/command with `xvfb-run`). This is not needed with
-  the default `HEADLESS=true`, and not needed at all if you're using
-  2captcha.
+- `/status` – runtime state (running/paused), heartbeat age, last cycle status/error, and A/B/C operation status with attempt/success/failure counters.
+- `/recheck` – enqueue an immediate `check` command via the existing command queue; waits briefly for completion and returns summary, otherwise returns queued state.
+- `/stats` – operation attempt summary plus system snapshot (DB size, disk free/total, PID/uptime, Python/runtime info, and memory info when available).
 
-## Running locally on Windows
+Exit codes:
 
-```powershell
-# One-off test: single check cycle, prints results, no Telegram, no booking
-python3.14 bot.py --once --dry-run
+- 0: healthy or successful
+- 2: degraded or a partial A/B/C check
+- 3: intentionally paused
+- 4: watcher unavailable or command timed out
 
-# Send a test Telegram message and exit
-python3.14 bot.py --test-telegram
+doctor checks configuration, database access, process heartbeat, catalog
+freshness, and per-operation freshness. The Docker healthcheck treats a paused
+watcher as alive and degraded/unavailable state as unhealthy.
 
-# Real run (uses MODE from .env)
-python3.14 bot.py
+## Alert policy
 
-# Real run but force-safe (never blocks/books, acts as notify_only)
-python3.14 bot.py --dry-run
-```
+Telegram messages are limited to:
 
-Leave the terminal window open (or run it under Task Scheduler / as a
-background process) - the script keeps a browser and the Telegram bot alive
-continuously. Python 3.8+ uses the Proactor event loop by default on
-Windows, which is what Playwright's subprocess-based browser launch needs,
-so no extra event loop policy configuration is required.
+- verified availability, with the official manual-booking link;
+- sustained operation/service outage and material escalation;
+- recovery after an outage that was alerted;
+- CAPTCHA contract change (the site changed CAPTCHA vendor — the watcher is
+  blind until the code is updated);
+- CAPTCHA cool-down (polling paused because the site is refusing us tokens);
+- once-daily digest at `DAILY_DIGEST_HOUR`;
+- admin command replies for `/status`, `/recheck`, and `/stats`.
 
-### Telegram commands while running
+Every message is prefixed with `[NODE_NAME]` so multiple vantage points are
+distinguishable in one chat.
 
-- `/status` - last check time and last cycle's per-queue result summary
-- `/pause` - stop polling (bot stays connected, just skips cycles)
-- `/resume` - resume polling
-- `/test` - confirms the bot is alive and listening
+An availability alert is deduplicated by operation and day/slot identity. It
+re-alerts only for an earlier result or after two successful empty cycles and a
+return. Telegram delivery retries after 5, 30, and 120 seconds. Exhausted
+messages remain undelivered in status and events.
 
-## Running in Docker
+Outage escalation is capped at level 3; beyond that a single "still down"
+reminder is sent at most every 6 hours, so a multi-hour outage cannot spam the
+chat.
 
-Build and run with docker-compose (uses the `.env` file you created above):
+No startup or heartbeat Telegram messages are sent. Logs and events contain no
+tokens, cookies, CAPTCHA values, applicant data, or raw API bodies. Redacted
+events are retained for seven days and capped at 10,000 rows.
 
-```powershell
-docker compose up --build -d
-docker compose logs -f
-```
+## CAPTCHA
 
-The `Dockerfile` is based on
-`mcr.microsoft.com/playwright/python:v1.61.0-jammy` to match the Playwright
-version installed locally (`playwright==1.61.0`). **Before deploying,
-double check that tag actually exists** (Microsoft doesn't publish an image
-for every single pip release):
+The site uses **hCaptcha** (it migrated away from reCAPTCHA v3; the page loads
+`js.hcaptcha.com/1/api.js?recaptchacompat=off`, so `window.grecaptcha` never
+exists). The token is still sent under the legacy `recaptchaToken` query
+parameter, which is what the site's own UI does.
 
-```powershell
-docker manifest inspect mcr.microsoft.com/playwright/python:v1.61.0-jammy
-```
+The watcher drives the page's own `window.hcaptcha`, rendering one invisible
+widget per browser context and calling `hcaptcha.execute(...)`. The sitekey is
+discovered at runtime from the DOM and `config.js`, falling back to the pinned
+`HCAPTCHA_SITE_KEY`, so a sitekey rotation does not cause an outage.
 
-If it doesn't exist, pick the closest published tag at or below your
-installed version from
-https://mcr.microsoft.com/en-us/product/playwright/python/tags and pin the
-matching `playwright==` version in `requirements.txt` so pip and the base
-image agree (mismatches between the pip package and the browser binaries
-baked into the image can break Playwright).
+Failures are classified so they are actionable:
 
-### Deployment sizing
+| Error | Meaning | Response |
+| --- | --- | --- |
+| `CaptchaContractError` | The page no longer exposes a usable hCaptcha API | One loud alert; needs a code change |
+| `CaptchaChallengeError` | hCaptcha demanded an interactive challenge | Exponential backoff, then cool-down |
+| `CaptchaError` | Server rejected the token (HTTP 400) | Same as above; reason text included |
 
-Headless Chromium under Playwright typically uses **~500-600MB RAM** for
-this kind of light single-page workload, plus overhead for Python and the
-Telegram long-poll connection. Recommendations:
+CAPTCHA failures are never retried inside a cycle: a rejected or challenged
+token is not transient, and retrying multiplies the request volume that damaged
+the IP's reputation in the first place.
 
-- **mikr.us**: pick a **2GB RAM tier or higher**. Their smallest tiers
-  (under 1GB) are too tight once you add OS + Docker + Chromium overhead
-  and will risk OOM kills during polling.
-- **Fallback**: **Hetzner CX22** (2 vCPU / 4GB RAM) is comfortably enough
-  headroom for this workload if mikr.us doesn't fit or isn't available.
+### Backoff and cool-down
 
-`docker-compose.yml` sets `mem_limit: 1g` and `shm_size: 1gb` (Chromium
-needs a reasonably sized `/dev/shm` or it can crash) - adjust upward if you
-add more concurrency, but this bot only ever runs one browser page at a
-time so 1GB is comfortable headroom.
+While every queue in a cycle is blocked, the poll interval doubles per blocked
+cycle up to `CAPTCHA_BACKOFF_MAX_SECONDS`. After
+`CAPTCHA_COOLDOWN_FAILURES` consecutive blocked cycles all polling pauses for
+`CAPTCHA_COOLDOWN_SECONDS` and one alert is sent. Any successful queue resets
+both immediately.
 
-## Notes on the one endpoint that isn't fully verified
+### Optional paid solver
 
-`GetPropertiesForSlot` (called right after a successful `BlockSlot`, to
-fetch the dynamic reservation form field definitions) was not live-tested
-end-to-end against a real blocked slot before building this bot - live
-testing it would have meant actually blocking a real slot, which this build
-was told not to do. It's implemented defensively:
+If the site refuses passive tokens even at low volume from a clean IP, enable a
+solver. It is **off by default** and only engaged after a native mint is
+refused, so it costs nothing while things work.
 
-- Called with `companyName` + `slotId` + `recaptchaToken` query params
-  (matching the pattern every other `Slot` GET endpoint uses).
-- The full raw response is logged at INFO level the first time it's
-  called for real, so you can see the exact shape it returns.
-- `build_filled_properties()` in `formfill.py` tries several common field-name
-  keys (`name`, `label`, `propertyName`, `displayName`) and several
-  common value keys (`value`, `propertyValue`, `fieldValue`) defensively,
-  and logs every fuzzy match it makes.
+    CAPTCHA_SOLVER_PROVIDER=capsolver   # or 2captcha
+    CAPTCHA_SOLVER_API_KEY=...
+    CAPTCHA_SOLVER_MAX_PER_HOUR=60      # hard spend cap
 
-If the real shape turns out to be different, the fix is localized to
-`get_properties_for_slot()` (`client.py`) and `build_filled_properties()`
-(`formfill.py`) - watch the logs the first time a slot actually gets blocked
-in `block_and_fill` mode and adjust based on what's logged.
+Usage and spend are visible in `/stats` and the daily digest.
 
-## Observability
+## Running a second vantage point (Raspberry Pi)
 
-**What you already get, with zero setup:** every log line goes to stdout
-(`docker compose logs -f`), and — more importantly for actually knowing the
-bot is alive — the watchdog built into `Watcher` (see `watcher.py`) already
-pushes the reliability signals that matter straight to Telegram: a startup
-message, a stale-check alert if `STALE_ALERT_MINUTES` passes with no
-successful check (so a captcha/site outage doesn't silently look like "no
-slots today"), an optional periodic heartbeat (`HEARTBEAT_HOURS`), and
-`/status` on demand. For a single-purpose bot like this, that's the signal
-that actually matters, and it already exists.
+Detection latency halves — at no extra load per IP — by running a second
+independent node whose schedule is offset by half an interval. Both nodes alert
+to the same chat, labelled by `NODE_NAME`. The nodes share nothing, so either
+one dying is invisible.
 
-What that setup *doesn't* give you: log history/search beyond `docker logs`,
-error aggregation (the same captcha-400 gets logged fresh every retry, with
-no dedup/trend view), and — the one real blind spot — if the whole
-container/process dies outright (crash loop, OOM, host reboot), nothing
-inside the process is left to send that "I'm down" Telegram message.
-`docker-compose.yml`'s `restart: unless-stopped` handles the container-level
-crash-and-restart case; it doesn't tell *you* it happened.
+On a 64-bit Raspberry Pi:
 
-Given this is one sequential polling loop in one process (not a
-multi-service system), here's what's worth adding and what isn't:
+    sudo bash install-rpi.sh /path/to/sv-source
 
-- **Skip distributed tracing.** Traces exist to show request flow *across*
-  services/spans; there's no such flow here to visualize, so instrumenting
-  one would be pure overhead for no signal.
-- **Sentry (implemented, opt-in): highest value for the effort.** Set
-  `SENTRY_DSN` in `.env` (from a Sentry project, or a Grafana Cloud stack's
-  Sentry-compatible endpoint) and every existing `logger.error(...)` call
-  automatically becomes a Sentry event — no other code changes — with the
-  preceding INFO-level log lines attached as breadcrumbs for context. This
-  gives you aggregation/trends/dedup across captcha failures, block/fill/
-  confirm failures, etc. that Telegram alone doesn't. Deliberately configured
-  with `traces_sample_rate=0` (error tracking only, see above) and
-  `include_local_variables=False` (so a traceback frame can never leak
-  `applicant.env`'s real PII — PESEL, document numbers — to Sentry's
-  servers). Leave `SENTRY_DSN` empty (default) to disable entirely; the
-  `sentry_sdk` package is never even imported in that case. Set
-  `SENTRY_ENVIRONMENT` (default `production`) so a local test run doesn't get
-  mixed into the same alert stream as the real deployment.
-- **Loki (scaffolded, opt-in): fixes the one real blind spot.** Shipping logs
-  to Grafana Cloud Loki doesn't just give you search/history — it lets you
-  set up ONE alert Sentry/Telegram can't: "no log line from this container in
-  N minutes," which fires even if the *entire process* is dead (unlike the
-  in-process stale-check watchdog, which needs the process itself alive to
-  warn you). One-time host setup:
+Playwright has no arm64 Linux Chromium build, so the installer uses the distro
+`chromium` and points the watcher at it via
+`PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH`. Then set in `/opt/sv/.env`:
 
-  ```bash
-  docker plugin install grafana/loki-docker-driver:latest --alias loki --grant-all-permissions
-  ```
+    NODE_NAME=rpi-home2
+    SCHEDULE_OFFSET_SECONDS=150      # ~half of SLOW_INTERVAL_SECONDS
 
-  Then get your Loki push URL from your Grafana Cloud stack's "Sending logs"
-  page (it embeds credentials as `https://<user-id>:<api-key>@host/loki/api/v1/push`),
-  set `LOKI_URL` in `.env`, and swap the commented `logging:` block in
-  `docker-compose.yml` for the active one (see the comments there — only one
-  logging driver can be active at a time).
-- **Log rotation (implemented, no setup needed):** `docker-compose.yml` now
-  caps local json-file logs at 10MB × 5 files, so months of continuous
-  polling can't quietly fill up the host disk. This applies regardless of
-  whether you also enable Loki.
+Occasional duplicate availability alerts are accepted deliberately: for slot
+hunting a duplicate is strictly better than a miss, and dedupe would couple the
+nodes and reintroduce a single point of failure.
 
-## Safety notes
+## Verified read-only contracts
 
-- The bot is single-flight: while waiting for your Confirm/Release button
-  press (up to 4 minutes) it does **not** keep polling other queues, so it
-  won't try to block a second slot while you're deciding on the first.
-- `--dry-run` and `MODE=notify_only` never call `BlockSlot` or
-  `ConfirmReservation` - safe for testing.
-- After a successful confirmation, the bot stops polling, but keeps the
-  Telegram connection alive for 10 minutes to make sure the success message
-  (and any follow-up commands) get delivered, then exits.
+The watcher validates that catalog entries have matching A/B/C prefixes, exact
+service names, and isReservationActive=true, then persists the snapshot.
+Availability must match the captured schema and return the requested
+operationId; malformed data is an operation failure, never an empty result.
+Slot details may be a JSON array or use availableSlots, slots, or times, and
+every entry must contain id and dateTime.
+
+Raw HAR captures are deliberately ignored and removed after sanitized fixtures
+are derived. Never commit HARs: they may contain tokens and cookies.
+
+## Test
+
+    python -m pytest -q
+
+Docker smoke tests require Docker on the host:
+
+    docker compose build
+    docker compose up -d
+    docker compose exec watcher python svctl.py doctor --json
+
+The live acceptance check is:
+
+    docker compose exec watcher python svctl.py check --wait 120 --json
+
+Accept only healthy A/B/C rows in SQLite. With empty availability arrays,
+Telegram must remain silent. The runtime contains GET endpoints only.
+
+### Current live verification
+
+On 2026-07-14, all three operation IDs (A, B, C) were validated and persisted.
+Each queue now runs in its own fresh browser context, so every reCAPTCHA mint
+is a first-mint — B and C no longer fail due to CAPTCHA exhaustion from a
+shared context. All three queues return healthy empty availability arrays and
+Telegram remains silent when no slots are open.

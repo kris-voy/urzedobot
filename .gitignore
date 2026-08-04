@@ -1,8 +1,10 @@
-# Secrets / PII — never commit
 .env
 applicant.env
-
-# Python
+HAR/
+data/
+*.db
+*.db-shm
+*.db-wal
 __pycache__/
 *.pyc
 .pytest_cache/

@@ -1,0 +1,11 @@
+{
+  "captchaConfig": {
+    "captchaEnable": true,
+    "hCaptchaEnable": true,
+    "hCaptchaBeforeCalendar": false
+  },
+  "simplePageConfig": {
+    "enable": false
+  }
+}
+
