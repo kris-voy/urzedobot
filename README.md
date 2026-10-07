@@ -2,7 +2,7 @@
 
 This service discovers the current A/B/C reservation operations from the
 official uw.bezkolejki.eu catalog, checks availability for all three queues
-every cycle (each queue gets its own fresh browser context so reCAPTCHA tokens
+every cycle (each queue gets its own isolated browser profile so CAPTCHA tokens
 never bleed between them), sends urgent outbound Telegram alerts, and accepts
 Telegram chat commands from the configured admin chat.
 It cannot block, fill, or confirm an appointment.
@@ -12,20 +12,25 @@ block_and_fill, and AUTO_CONFIRM=true.
 
 ## Deploy — option A: LXC / VM with real desktop browser (recommended)
 
-Running a real visible Chromium scores highest on reCAPTCHA v3. Use this on
-any Proxmox LXC or VM that has a desktop session (Xorg + openbox or xfce4).
+Use Google Chrome Stable on a current Ubuntu VM with a normal desktop session
+(Xorg plus Openbox or XFCE). The watcher runs one browser process at a time and
+keeps separate durable profiles for catalog discovery and queues A/B/C.
 
-1. Install system deps and Playwright:
+1. Install Google Chrome Stable from Google's official Ubuntu package, then
+   install Python and a lightweight desktop:
 
-       apt-get install -y python3 python3-pip xorg openbox
-       pip3 install -r requirements.txt
-       playwright install chromium
-       playwright install-deps chromium
+       sudo apt-get install -y python3 python3-venv xorg openbox
+       python3 -m venv /opt/sv/.venv
+       /opt/sv/.venv/bin/pip install -r /opt/sv/requirements.txt
+       /usr/bin/google-chrome --version
 
 2. Copy config.example.env to .env and fill in TELEGRAM_BOT_TOKEN and
    TELEGRAM_CHAT_ID. Set:
 
        HEADLESS=false
+       PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/google-chrome
+       PLAYWRIGHT_PROFILE_ROOT=/opt/sv/data/browser-profiles
+       DATABASE_PATH=/opt/sv/data/sv.db
 
 3. Create a systemd user service (e.g. `~/.config/systemd/user/sv.service`):
 
@@ -36,7 +41,7 @@ any Proxmox LXC or VM that has a desktop session (Xorg + openbox or xfce4).
        [Service]
        Environment=DISPLAY=:0
        WorkingDirectory=/opt/sv
-       ExecStart=/usr/bin/python3 bot.py
+       ExecStart=/opt/sv/.venv/bin/python bot.py
        Restart=always
        RestartSec=10
 
@@ -48,8 +53,8 @@ any Proxmox LXC or VM that has a desktop session (Xorg + openbox or xfce4).
        systemctl --user enable sv
        systemctl --user start sv
 
-State lives at DATABASE_PATH (default `/app/data/sv.db`; override in .env for
-a non-container path, e.g. `/home/user/sv.db`).
+SQLite state and Chrome profiles live below `/opt/sv/data`. Keep that directory
+private to the service user and include it in VM backups.
 
 ## Deploy — option B: Docker with headless Xvfb (no local desktop needed)
 
@@ -240,8 +245,7 @@ Telegram must remain silent. The runtime contains GET endpoints only.
 
 ### Current live verification
 
-On 2026-07-14, all three operation IDs (A, B, C) were validated and persisted.
-Each queue now runs in its own fresh browser context, so every reCAPTCHA mint
-is a first-mint — B and C no longer fail due to CAPTCHA exhaustion from a
-shared context. All three queues return healthy empty availability arrays and
-Telegram remains silent when no slots are open.
+On 2026-10-07, all three operation IDs (A, B, C), the hCaptcha integration, and
+the public frontend routes were validated. Each queue uses an isolated browser
+context or persistent profile, so B and C cannot reuse a consumed CAPTCHA token
+from another queue.

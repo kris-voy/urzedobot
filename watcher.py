@@ -234,27 +234,28 @@ class Watcher:
                 f"{self.captcha_failure_streak} blocked cycles",
             )
 
-    def _base_interval(self) -> int:
-        return (
-            self.config.fast_interval_seconds
-            if is_within_fast_window(self.config.fast_window)
-            else self.config.slow_interval_seconds
-        )
-
     def next_interval_seconds(self) -> float:
         """Poll interval with exponential backoff while CAPTCHA keeps blocking us.
 
         Hammering at a fixed rate while actively blocked only deepens the
         reputation hole that caused the block.
         """
-        interval = float(self._base_interval())
+        in_fast_window = is_within_fast_window(self.config.fast_window)
+        interval = float(
+            self.config.fast_interval_seconds
+            if in_fast_window
+            else self.config.slow_interval_seconds
+        )
         if self.captcha_failure_streak:
             exponent = min(self.captcha_failure_streak, 12)
             interval = min(
                 interval * (CAPTCHA_BACKOFF_MULTIPLIER ** exponent),
                 float(self.config.captcha_backoff_max_seconds),
             )
-        return jittered(interval, self.config.jitter_percent)
+        randomized = jittered(interval, self.config.jitter_percent)
+        if not in_fast_window:
+            return max(float(self.config.slow_interval_seconds), randomized)
+        return randomized
 
     async def run_cycle(self) -> dict[str, Any]:
         result: dict[str, Any] = {}
@@ -298,7 +299,7 @@ class Watcher:
                 await asyncio.sleep(self.config.queue_stagger_seconds)
             self.store.record_attempt(prefix)
             try:
-                await self.client.begin_queue()
+                await self.client.begin_queue(prefix)
                 days = await self.client.get_available_days(operation_id)
                 successes += 1
                 self._enqueue_solver_alert()

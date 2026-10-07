@@ -59,8 +59,8 @@ class FakeClient:
         self.calls.append("discover_catalog")
         return {prefix: CATALOG[prefix] for prefix in prefixes}
 
-    async def begin_queue(self):
-        self.calls.append("begin_queue")
+    async def begin_queue(self, prefix):
+        self.calls.append(("begin_queue", prefix))
 
     async def get_available_days(self, operation_id):
         self.calls.append(("days", operation_id))
@@ -213,6 +213,17 @@ def test_captcha_failures_trigger_exponential_backoff(tmp_path):
     assert first > base
     asyncio.run(watcher.run_cycle())
     assert watcher.next_interval_seconds() > first
+
+
+def test_non_critical_jitter_never_polls_more_than_once_per_hour(tmp_path, monkeypatch):
+    monkeypatch.setattr("watcher.is_within_fast_window", lambda _: False)
+    _, watcher = setup(
+        tmp_path,
+        FakeClient(),
+        slow_interval_seconds=3600,
+        jitter_percent=0.35,
+    )
+    assert all(watcher.next_interval_seconds() >= 3600 for _ in range(100))
 
 
 def test_backoff_is_capped_and_resets_on_success(tmp_path):
