@@ -25,6 +25,14 @@ def test_notify_only_is_the_only_mode():
             make_config(mode=mode)
 
 
+def test_non_critical_interval_defaults_to_one_hour():
+    assert make_config().slow_interval_seconds == 3600
+
+
+def test_critical_interval_defaults_to_three_minutes():
+    assert make_config().fast_interval_seconds == 180
+
+
 def test_auto_confirm_is_rejected():
     with pytest.raises(ValueError, match="AUTO_CONFIRM"):
         make_config(auto_confirm=True)

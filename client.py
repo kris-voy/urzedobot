@@ -7,6 +7,7 @@ import re
 import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
+from pathlib import Path
 from typing import Any
 
 from playwright.async_api import (
@@ -166,6 +167,10 @@ class BezkolejkiClient:
         self._last_captcha_mint = 0.0
         self._sitekey: str | None = None
         self._widget_id: str | None = None
+        self._persistent_profile_root = os.environ.get(
+            "PLAYWRIGHT_PROFILE_ROOT", ""
+        ).strip()
+        self._launch_options: dict[str, Any] = {}
         self.solver = solver or CaptchaSolver(
             config.captcha_solver_provider,
             config.captcha_solver_api_key,
@@ -183,7 +188,13 @@ class BezkolejkiClient:
         executable = os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH", "").strip()
         if executable:
             launch["executable_path"] = executable
-        self._browser = await self._playwright.chromium.launch(**launch)
+        self._launch_options = launch
+        if self._persistent_profile_root:
+            profile_root = Path(self._persistent_profile_root)
+            profile_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+            profile_root.chmod(0o700)
+        else:
+            self._browser = await self._playwright.chromium.launch(**launch)
 
     async def stop(self) -> None:
         await self._close_context()
@@ -196,30 +207,38 @@ class BezkolejkiClient:
         self._auth_token = None
 
     async def begin_cycle(self) -> None:
-        """Open a fresh context for catalog discovery (service-level)."""
-        if not self._browser:
-            raise RuntimeError("browser is not started")
-        await self._close_context()
-        self._context = await self._browser.new_context(locale="pl-PL")
+        """Open the catalog browser context."""
+        await self._begin_context("catalog")
         await self._open_page()
         self._auth_token = None
 
-    async def begin_queue(self) -> None:
-        """Open a brand-new browser context for one queue's availability check.
+    async def begin_queue(self, prefix: str) -> None:
+        """Open an isolated browser context for one queue's availability check.
 
-        Each queue gets its own isolated context so that every CAPTCHA mint
-        is a first-mint in a clean session — the root cause of B and C failing
-        in the old shared-context approach.
+        Persistent mode gives every queue its own durable profile. Ephemeral mode
+        keeps the previous fresh-context behavior. In both modes, queues never
+        share a context or a consumed CAPTCHA token.
         """
-        if not self._browser:
-            raise RuntimeError("browser is not started")
-        await self._close_context()
-        # Deliberately use Chromium's native identity: no UA override, stealth
-        # script, proxy/profile rotation, or launch-time masking arguments.
-        self._context = await self._browser.new_context(locale="pl-PL")
+        await self._begin_context(f"queue-{prefix.lower()}")
         await self._open_page()
         self._auth_token = None
         self._last_captcha_mint = 0.0
+
+    async def _begin_context(self, profile_name: str) -> None:
+        if not self._playwright:
+            raise RuntimeError("browser is not started")
+        await self._close_context()
+        # Deliberately use Chrome's native identity: no UA override, stealth
+        # script, proxy rotation, or launch-time masking arguments.
+        if self._persistent_profile_root:
+            profile_dir = Path(self._persistent_profile_root) / profile_name
+            self._context = await self._playwright.chromium.launch_persistent_context(
+                str(profile_dir), locale="pl-PL", **self._launch_options
+            )
+        else:
+            if not self._browser:
+                raise RuntimeError("browser is not started")
+            self._context = await self._browser.new_context(locale="pl-PL")
 
     async def _close_context(self) -> None:
         if self._context:
@@ -233,8 +252,9 @@ class BezkolejkiClient:
 
     async def _open_page(self) -> None:
         assert self._context
-        if self._page and not self._page.is_closed():
-            await self._page.close()
+        for page in self._context.pages:
+            if not page.is_closed():
+                await page.close()
         self._page = await self._context.new_page()
         self._page.set_default_timeout(API_TIMEOUT_MS)
         await self._page.goto(
